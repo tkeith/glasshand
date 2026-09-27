@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.output/
+.tanstack/
+__pycache__/
+*.pyc
+.env
+*.sqlite*
