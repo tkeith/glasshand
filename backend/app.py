@@ -17,7 +17,7 @@ SESSION=hmac.new(ACCESS.encode(),b'glasshand-session-v1',hashlib.sha256).hexdige
 db=sqlite3.connect(DATA/'history.sqlite');db.execute('create table if not exists events (id integer primary key, at real, kind text, text text, run_id text)');db.commit()
 calpath=DATA/'calibration.json'
 cal=json.loads(calpath.read_text()) if calpath.exists() else {'left':0,'top':0,'right':0,'bottom':0,'rotation':0}
-state={'connected':False,'video':False,'hid':False,'detail':'Waiting for device bridge','last_seen':0,'frame_at':0,'width':0,'height':0}
+state={'connected':False,'video':False,'hid':False,'control':False,'detail':'Waiting for device bridge','last_seen':0,'frame_at':0,'width':0,'height':0}
 frame=b'';device=None;pending={};run=None;runner=None;approval=None;command_lock=asyncio.Lock();send_lock=asyncio.Lock();attempts=[]
 
 def event(kind,text,rid=None):
@@ -101,6 +101,7 @@ async def send(payload):
  async with send_lock:await device.send_json(payload)
 async def execute(a,source):
  async with command_lock:
+  if not state.get('control'):raise RuntimeError('Read-only session: another operator controls this phone')
   if not fresh():raise RuntimeError('No fresh phone video. Input blocked.')
   if not state['hid']:raise RuntimeError('USB control is not connected')
   rid=uuid.uuid4().hex;f=asyncio.get_running_loop().create_future();pending[rid]=f
@@ -123,7 +124,8 @@ async def stop(reason='Stopped by operator'):
  approval=None
  if run and run['status'] in ['running','approval']:
   run['status']='stopped';run['pending']=None;event('stop',reason,run['id'])
- try:await send({'kind':'stop'})
+ try:
+  if state.get('control'):await send({'kind':'stop'})
  except Exception:pass
 @app.post('/api/stop')
 async def stop_route():await stop();return {'ok':True}
@@ -139,6 +141,7 @@ class Decision(BaseModel):approve:bool
 async def start(body:Task):
  global run,runner
  if run and run['status'] in ['running','approval']:raise HTTPException(409,'A task is already active')
+ if not state.get('control'):raise HTTPException(409,'Read-only session: another operator controls this phone')
  if not fresh() or not state['hid']:raise HTTPException(409,'Connect live video and USB control before starting a task')
  if not INFERENCE:raise HTTPException(503,'Inference is not configured')
  run={'id':uuid.uuid4().hex[:10],'task':body.task,'status':'running','step':0,'pending':None,'approve_each':body.approve_each,'started':time.time()}
@@ -159,7 +162,7 @@ async def agent(current):
     if not fresh():raise RuntimeError('Live video lost; task stopped')
     before=state['frame_at']
     msg={'role':'user','content':[{'type':'text','text':'Task: '+current['task']+'\nRecent actions: '+json.dumps(prior[-8:])},{'type':'image_url','image_url':{'url':'data:image/jpeg;base64,'+base64.b64encode(frame).decode()}}]}
-    response=await client.post('https://api.vultrinference.com/v1/chat/completions',headers={'Authorization':'Bearer '+INFERENCE},json={'model':MODEL,'messages':[{'role':'system','content':SYSTEM},msg],'max_tokens':700,'temperature':.15})
+    response=await client.post('https://api.vultrinference.com/v1/chat/completions',headers={'Authorization':'Bearer '+INFERENCE},json={'model':MODEL,'messages':[{'role':'system','content':SYSTEM},msg],'max_tokens':2000,'temperature':.15})
     if response.status_code!=200:raise RuntimeError('Inference service error '+str(response.status_code))
     raw=response.json()['choices'][0]['message']['content'].strip();raw=raw.removeprefix('```json').removeprefix('```').removesuffix('```').strip()
     try:a=json.loads(raw)
@@ -175,7 +178,7 @@ async def agent(current):
      if not allowed:current['status']='stopped';event('stop','Action declined',current['id']);return
      current['status']='running'
     # execute rechecks freshness/HID after reasoning and any human wait.
-    await execute(action,'agent');prior.append(a)
+    await execute(action,'agent');prior.append(a);before=time.time()
     await asyncio.sleep(1.2)
     for _ in range(25):
      if state['frame_at']>before:break
@@ -205,7 +208,7 @@ async def device_socket(ws:WebSocket):
     except Exception:continue
    elif m.get('text'):
     data=json.loads(m['text'])
-    if data.get('kind')=='status':state.update({k:data[k] for k in ['video','hid','detail'] if k in data})
+    if data.get('kind')=='status':state.update({k:data[k] for k in ['video','hid','control','detail'] if k in data})
     if data.get('kind')=='ack':
      f=pending.get(data.get('id'))
      if f and not f.done():f.set_result(data)

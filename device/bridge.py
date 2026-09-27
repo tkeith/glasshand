@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Outbound-only Pi bridge: CSI video + existing USB gadget. No model/API credentials."""
 import glob,json,os,queue,re,select,struct,subprocess,threading,time
+from pathlib import Path
 import websocket
+import urllib.request
 URL=os.environ['GLASSHAND_DEVICE_URL'];TOKEN=os.environ['GLASSHAND_DEVICE_TOKEN']
+CONTROL=os.getenv('GLASSHAND_CONTROL_ENABLED','0')=='1'
+CAPTURE=os.getenv('GLASSHAND_CAPTURE_URL','http://127.0.0.1:8092')
 ws=None;send_lock=threading.Lock();generation=0;commands=queue.Queue(maxsize=5);last_frame=0
 
 def send(data,binary=False):
@@ -22,11 +26,14 @@ def report(path,data):
   if os.write(fd,data)!=len(data):raise RuntimeError('Incomplete USB report')
  finally:os.close(fd)
 def release():
+ if not CONTROL:return
  for path,data in [('/dev/hidg0',bytes(8)),('/dev/hidg1',bytes(6)),('/dev/hidg2',bytes(2))]:
   try:report(path,data)
   except OSError:pass
   except RuntimeError:pass
-def mouse(x,y,pressed=0):report('/dev/hidg1',struct.pack('<BHHb',pressed,round(x*32767),round(y*32767),0))
+def mouse(x,y,pressed=0):
+ if Path('/sys/kernel/config/usb_gadget/solid_iphone/functions/hid.mouse/report_length').read_text().strip()!='6':raise RuntimeError('Absolute mouse is not configured; pointer input blocked')
+ report('/dev/hidg1',struct.pack('<BHHb',pressed,round(x*32767),round(y*32767),0))
 def keycode(code,modifier=0):
  report('/dev/hidg0',bytes([modifier,0,code,0,0,0,0,0]));time.sleep(.035);report('/dev/hidg0',bytes(8))
 plain="1234567890\n\x1b\b\t -=[]\\;\'`,./"
@@ -40,6 +47,7 @@ def worker():
  while True:
   m,g=commands.get();a=m['action']
   def check():
+   if not CONTROL:raise RuntimeError('Read-only session: another operator controls this phone')
    if g!=generation:raise RuntimeError('Action cancelled')
    if time.time()>m['deadline']:raise RuntimeError('Action expired')
    if not hid_ready():raise RuntimeError('USB host is not connected')
@@ -56,7 +64,10 @@ def worker():
     if any(c not in keys for c in a['text']):raise RuntimeError('Unsupported keyboard character')
     for c in a['text']:check();keycode(*keys[c]);time.sleep(.02)
    elif typ=='key':
-    if a['key']=='home':report('/dev/hidg2',struct.pack('<H',0x223));time.sleep(.08);report('/dev/hidg2',bytes(2))
+    if a['key']=='home':
+     if Path('/sys/kernel/config/usb_gadget/solid_iphone/configs/c.1/hid.consumer').exists():
+      report('/dev/hidg2',struct.pack('<H',0x223));time.sleep(.12);report('/dev/hidg2',bytes(2))
+     else:keycode(11,8) # Command-H on iPhone
     else:keycode({'enter':40,'backspace':42,'escape':41,'tab':43}[a['key']])
    else:raise RuntimeError('Unknown action')
    send({'kind':'ack','id':m['id'],'ok':True})
@@ -69,38 +80,18 @@ def capture():
  global last_frame
  while True:
   if not ws:time.sleep(1);continue
-  signal=bool(re.search(r'power_present:\s*1',cmd(['v4l2-ctl','--get-ctrl=power_present'])))
-  hid=hid_ready()
-  try:send({'kind':'status','video':False,'hid':hid,'detail':'Waiting for HDMI video' if not signal else 'Starting capture'})
-  except Exception:time.sleep(2);continue
-  if not signal:time.sleep(2);continue
-  timing=cmd(['v4l2-ctl','--query-dv-timings']);w=re.search(r'Active width:\s*(\d+)',timing);h=re.search(r'Active height:\s*(\d+)',timing)
-  if not w or not h:time.sleep(2);continue
-  width,height=int(w[1]),int(h[1]);cmd(['v4l2-ctl','--set-dv-bt-timings=query']);cmd(['v4l2-ctl',f'--set-fmt-video=width={width},height={height},pixelformat=UYVY'])
-  proc=subprocess.Popen(['ffmpeg','-nostdin','-loglevel','error','-threads','1','-f','v4l2','-input_format','uyvy422','-video_size',f'{width}x{height}','-i','/dev/video0','-vf',"fps=3,scale='min(1280,iw)':-2",'-threads','1','-f','image2pipe','-vcodec','mjpeg','-q:v','5','pipe:1'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
-  buf=b'';last=time.monotonic();last_status=0
   try:
-   while ws and proc.poll() is None:
-    ready,_,_=select.select([proc.stdout],[],[],1)
-    if not ready:
-     if time.monotonic()-last>5:break
-     continue
-    chunk=os.read(proc.stdout.fileno(),65536)
-    if not chunk:break
-    buf+=chunk
-    while b'\xff\xd9' in buf:
-     end=buf.index(b'\xff\xd9')+2;img=buf[:end];buf=buf[end:];start=img.find(b'\xff\xd8')
-     if start<0:continue
-     send(img[start:],True);last_frame=last=time.monotonic()
-     if last-last_status>1:
-      send({'kind':'status','video':True,'hid':hid_ready(),'detail':'Live HDMI capture'});last_status=last
-    if len(buf)>4_000_000:buf=b''
-  except Exception:pass
-  finally:
-   proc.terminate()
-   try:proc.wait(timeout=2)
-   except subprocess.TimeoutExpired:proc.kill();proc.wait()
-  time.sleep(1)
+   with urllib.request.urlopen(CAPTURE+'/state',timeout=3) as r:info=json.load(r)
+   online=bool(info['result']['source']['online'])
+   if online:
+    with urllib.request.urlopen(CAPTURE+'/snapshot',timeout=3) as r:img=r.read(2_000_000)
+    if not img.startswith(b'\xff\xd8'):raise RuntimeError('Invalid capture image')
+    send(img,True);last_frame=time.monotonic()
+   send({'kind':'status','video':online,'hid':hid_ready(),'control':CONTROL,'detail':('Live HDMI capture' if CONTROL else 'Read-only: phone in use by another operator') if online else 'Waiting for HDMI video'})
+  except Exception:
+   try:send({'kind':'status','video':False,'hid':hid_ready(),'control':CONTROL,'detail':'Capture service unavailable'})
+   except Exception:pass
+  time.sleep(.35)
 threading.Thread(target=worker,daemon=True).start();threading.Thread(target=capture,daemon=True).start()
 while True:
  try:
